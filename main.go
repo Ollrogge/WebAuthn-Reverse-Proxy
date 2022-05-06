@@ -6,8 +6,9 @@ import (
     "github.com/gorilla/mux"
     _ "reflect"
     "github.com/fxamacker/cbor/v2"
-    "errors"
+    _ "errors"
     "encoding/binary"
+    "bytes"
 )
 
 const (
@@ -16,80 +17,126 @@ const (
 )
 
 type Credential struct {
-    Id []byte `cbor:"id"`
+    Id []byte   `cbor:"id"`
     Type string `cbor:"type"`
 }
 
-type AuthData struct {
+type CredentialId struct {
+    Id [16]byte
+    //todo: public key credential source
+}
+
+type CredentialPublicKey struct {
+    Kty int32     `cbor:"1,keyasint"`
+    Alg int32     `cbor:"3,keyasint"`
+    Crv int32     `cbor:"-1,keyasint"`
+    X [32]byte  `cbor:"-2,keyasint"`
+    Y [32]byte  `cbor:"-3,keyasint"`
+}
+
+type AttestedCredentialData struct {
+    Aaguid [16]byte
+    CredentialIdLength [2]byte
+    CredentialId CredentialId
+    CredentialPublicKey CredentialPublicKey
+}
+
+type AuthDataAttest struct {
     /* auth_data_header */
     RpIdHash [32]byte
     Flags uint8
-    Counter uint32
-    /* attested_cred_data_header */
-    Aaguid [16]byte
-    CredLenH uint8
-    CredLenL uint8
-    /* cred_id */
-    Id [16]byte // assume we don't send encrypted credentials
+    SignCount uint32
+    AttestedCredentialData AttestedCredentialData
 }
 
-type AssertionResp struct {
+type AuthDataAssert struct {
+    /* auth_data_header */
+    RpIdHash [32]byte
+    Flags uint8
+    SignCount uint32
+}
+
+/* packed format */
+type AttestationStatement struct {
+    Alg int       `cbor:"alg"`
+    Sig [72]byte  `cbor:"sig"`
+}
+
+type GetAssertionResp struct {
     Credential Credential 
-    AuthData AuthData
+    AuthData AuthDataAssert
     Sig []byte
 }
 
-func (p* AuthData) Unmarshal(data []byte) error {
-    if len(data) < 37 {
-        return errors.New("need at least 37 bytes for authData")
-    }
-
-    copy(p.RpIdHash[:], data[:32])
-    p.Flags = data[32]
-    p.Counter = binary.LittleEndian.Uint32(data[33:37])
-
-    return nil 
+type MakeCredentialResp struct {
+    AuthData AuthDataAttest
+    Format string
+    AttestationStatement AttestationStatement
 }
 
+func (p *AuthDataAttest) Unmarshal(data []byte) error {
+    return Unmarshal(p, data);
+}
 
-/*
-[AttestedCredentialData(aaguid: h'39633239353836356661326333366237', credential_id: h'885d607c7e79801893204c2700ddb4c9', public_key: {1: 2, 3: -7, -1: 1, -2: b'\x93A::\x7fP\xac\x9c\xb0\x0c\x1c\x01\xa8\x02\x84\x13FfgW\xc1\x7f\x97\xc2\x90u\x02uD2j\x00', -3: b'W\xdfd\xa6\xd5\xf4\xb6\xda\xc2u\xe1\x03R8\xacM7\x1b\xbf\x86&V\xba\xf1A\xbbI\xca\x9d\xe2Z\xa2'}]
-*/
-func decodeMakeCredentialResp() {
-    type resp struct {
+func (p *AuthDataAssert) Unmarshal(data []byte) error {
+    return Unmarshal(p, data);
+}
+
+func Unmarshal[T AuthDataAttest | AuthDataAssert](p *T, data []byte) error {
+
+    r := bytes.NewReader(data);
+
+    return binary.Read(r, binary.LittleEndian, p);
+}
+
+func decodeMakeCredentialResp(resp *MakeCredentialResp, data []byte) {
+    type _resp struct {
         Format string `cbor:"1,keyasint"`
         AuthData []byte `cbor:"2,keyasint"`
-        AttStatement 
+        AttStatement AttestationStatement 
     }
+
+    var v _resp
+    if err := cbor.Unmarshal(data, &v); err != nil {
+        fmt.Println("error: ", err)
+    }
+
+    var a AuthDataAttest
+    if err := a.Unmarshal(v.AuthData); err != nil {
+        fmt.Println("error: ", err)
+    }
+
+    resp.AuthData = a
+    resp.Format = v.Format
+    resp.AttestationStatement = v.AttStatement
 }
 
-func decodeAssertionResp(assertion* AssertionResp, data []byte) {
-    type resp struct {
+func decodeAssertionResp(resp *GetAssertionResp, data []byte) {
+    type _resp struct {
         Credential Credential `cbor:"1,keyasint"`
         AuthData []byte `cbor:"2,keyasint"`
         Sig []byte `cbor:"3,keyasint"`
     }
 
-    var v resp
+    var v _resp
     if err := cbor.Unmarshal(data, &v); err != nil {
 		fmt.Println("error: ", err)
 	}
 
-    var a AuthData
+    var a AuthDataAssert
     if err := a.Unmarshal(v.AuthData); err != nil {
         fmt.Println("error: ", err)
     }
 
-    assertion.Credential = v.Credential
-    assertion.AuthData = a
-    assertion.Sig = v.Sig
+    resp.Credential = v.Credential
+    resp.AuthData = a
+    resp.Sig = v.Sig
 }
 
 func fido2Data(w http.ResponseWriter, req *http.Request) {
 
     vars := mux.Vars(req)
-    
-    fmt.Println("vars: ", vars)
+    _ = vars
 
     switch req.Method {
     case "GET":
@@ -104,11 +151,14 @@ func fido2Data(w http.ResponseWriter, req *http.Request) {
         data := []byte(req.PostForm["fidoData"][0])
         switch data[0] {
         case MakeCredential:
-            decodeMakeCredentialResp()
+            var resp MakeCredentialResp
+            decodeMakeCredentialResp(&resp, data[1:])
+            fmt.Println("MakeCredential: ", resp);
             break;
         case GetAssertion:
-            var resp AssertionResp
+            var resp GetAssertionResp
             decodeAssertionResp(&resp, data[1:])
+            fmt.Println("GetAssertion: ", resp);
             break;
         }
     }
