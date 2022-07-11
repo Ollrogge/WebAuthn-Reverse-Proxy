@@ -32,13 +32,13 @@ const (
 	MakeCredentialFinish    = 0x1
 	GetAssertionBegin       = 0x2
 	GetAssertionFinish      = 0x3
-	BaseUrl                 = "http://localhost:8080"
+	BaseUrl                 = "http://localhost:8010"
 	MakeCredentialBeginUrl  = "/register/begin"
 	MakeCredentialFinishUrl = "/register/begin"
 	GetAssertionBeginUrl    = "/login/begin"
 	GetAssertionFinishUrl   = "/login/finish"
 	DefaultUsername         = "user1"
-	Testing                 = true
+	Testing                 = false
 )
 
 type Credential struct {
@@ -137,6 +137,17 @@ type CollectedClientData struct {
 	Origin       string `json:"origin"`
 	CrossOrigin  bool   `json:"crossOrigin,omitempty"`
 	TokenBinding []byte `json:"tokenBinding,omitempty"`
+}
+
+// us -> authenticator
+type AuthenticatorGetAssertion struct {
+	RpId           string   `cbor:"1,keyasint"`
+	ClientDataHash []byte   `cbor:"2,keyasint"`
+	AllowList      [][]byte `cbor:"3,keyasint"`
+}
+
+type Response struct {
+	FidoData []byte `json:"fidoData"`
 }
 
 type State struct {
@@ -286,6 +297,7 @@ func (p *GetAssertionResp) UnmarshalTest(data *libfido2.Assertion) error {
 
 // https://medium.com/@ayeshajayasankha/making-http-requests-with-go-acbcf6e3f1d4
 func handleMakeCredentialBegin() error {
+	log.Println("handleMakeCredentialBegin")
 	req_url := BaseUrl + MakeCredentialBeginUrl + "/" + DefaultUsername
 
 	params := url.Values{}
@@ -320,8 +332,10 @@ func handleMakeCredentialBegin() error {
 	return nil
 }
 
-func handleGetAssertionBegin() error {
-	req_url := BaseUrl + GetAssertionBeginUrl + "/" + DefaultUsername
+func handleGetAssertionBegin(username string) ([]byte, error) {
+	log.Println("handleGetAssertionBegin")
+	//TODO: use DevEUI instead of DefaultUsername
+	req_url := BaseUrl + GetAssertionBeginUrl + "/" + username
 
 	params := url.Values{}
 	params.Add("userVerification", "discouraged")
@@ -336,38 +350,41 @@ func handleGetAssertionBegin() error {
 
 	if err != nil {
 		fmt.Println("error: ", err)
-		return err
+		return nil, err
 	}
 
 	resp, err := client.Do(req)
 
 	if err != nil {
 		fmt.Println("error: ", err)
-		return err
+		return nil, err
 	}
 
 	gCookieJar = *cookieJar
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var credentialRequest CredentialRequestOptions
 
 	err = json.Unmarshal(body, &credentialRequest)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	/*
+		build clientstate for this authentication flow
+	*/
 	err = gClientData.Unmarshal(&credentialRequest.PublicKey)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	clientDataJson, err := json.Marshal(gClientData)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	clientDataHash := sha256.Sum256(clientDataJson)
@@ -389,18 +406,33 @@ func handleGetAssertionBegin() error {
 			clientDataHash[:], credentialIds)
 
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		pAssertion = assertion
 
 		handleAssertionFinish(nil)
+	} else {
+		var assert AuthenticatorGetAssertion
+		assert.RpId = credentialRequest.PublicKey.RpId
+		// In a nutshell, the [:] operator allows you to create a slice from an array
+		// array = fixed size, slice = variable size
+		assert.ClientDataHash = clientDataHash[:]
+		assert.AllowList = credentialIds
+
+		b, err := cbor.Marshal(assert)
+		if err != nil {
+			return nil, err
+		}
+
+		return b, nil
 	}
 
-	return nil
+	return nil, nil
 }
 
 func handleAssertionFinish(data []byte) error {
+	log.Println("handleAssertionFinish")
 	var assertResp GetAssertionResp
 	var err error
 
@@ -456,11 +488,14 @@ func handleAssertionFinish(data []byte) error {
 	return nil
 }
 
+// https://blog.questionable.services/article/http-handler-error-handling-revisited/
 func fido2Data(w http.ResponseWriter, req *http.Request) {
 
 	vars := mux.Vars(req)
-	_ = vars
+
+	log.Println("vars: ", vars)
 	var err error
+	var res []byte
 
 	switch req.Method {
 	case "GET":
@@ -468,11 +503,21 @@ func fido2Data(w http.ResponseWriter, req *http.Request) {
 		fmt.Println("Keys: ", req.URL.Query())
 	case "POST":
 		if err := req.ParseForm(); err != nil {
-			fmt.Fprintf(w, "ParseForm() err: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
+		fmt.Println("Postform: ", req.PostForm)
+
+		if len(req.PostForm) == 0 {
+			http.Error(w, "Missing post params", http.StatusInternalServerError)
+			return
+		}
+
+		log.Println("Postform fidoData: ", req.PostForm["fidoData"])
+
 		data := []byte(req.PostForm["fidoData"][0])
+
 		switch data[0] {
 		case MakeCredentialBegin:
 			handleMakeCredentialBegin()
@@ -483,7 +528,12 @@ func fido2Data(w http.ResponseWriter, req *http.Request) {
 			fmt.Println("MakeCredential: ", resp)
 			break
 		case GetAssertionBegin:
-			err = handleGetAssertionBegin()
+			user := vars["user"]
+			if len(user) == 0 {
+				http.Error(w, "GetAssertionBegin: Username missing", http.StatusBadRequest)
+				return
+			}
+			res, err = handleGetAssertionBegin(user)
 			break
 		case GetAssertionFinish:
 			err = handleAssertionFinish(data[1:])
@@ -492,10 +542,32 @@ func fido2Data(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if err != nil {
-		log.Fatal("Error: ", err)
+		log.Println("Error: ", err)
+		http.Error(w, "Sth went wrong", 500)
 	}
 
-	fmt.Fprintf(w, "test \n")
+	if len(res) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		enc, err := json.Marshal(Response{FidoData: res})
+		if err != nil {
+			http.Error(w, "Json encode response", http.StatusBadRequest)
+			return
+		}
+
+		w.Write(enc)
+	} else {
+		fmt.Fprintf(w, "Success \n")
+	}
+
+	/*
+		if len(res) > 0 {
+			log.Println("Returning: ", res)
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Write(res)
+		} else {
+			fmt.Fprintf(w, "Success \n")
+		}
+	*/
 }
 
 // for server: use chromium and domain http://localhost:8080/
@@ -504,9 +576,9 @@ func main() {
 	r := mux.NewRouter()
 	r.HandleFunc("/fidodata/{user}", fido2Data)
 
-	fmt.Println("Starting http server")
+	fmt.Println("Starting http server on port 8005")
 
-	http.ListenAndServe(":8000", r)
+	http.ListenAndServe(":8005", r)
 }
 
 // https://github.com/keys-pub/go-libfido2
