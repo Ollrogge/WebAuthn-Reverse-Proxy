@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	_ "errors"
 	"fmt"
 	"io"
@@ -118,6 +119,7 @@ type PublicKeyCredentialDescriptor struct {
 	Type       string   `json:"type"`
 	Id         []byte   `json:"id"`
 	Transports []string `json:"transports,omitempty"`
+	PublicKey  []byte   `json:"publicKey,omitempty"`
 }
 
 type PublicKeyCredentialRequestOptions struct {
@@ -147,7 +149,8 @@ type AuthenticatorGetAssertion struct {
 }
 
 type Response struct {
-	FidoData []byte `json:"fidoData"`
+	FidoData  []byte `json:"fidoData"`
+	PublicKey []byte `json:"publicKey,omitempty"`
 }
 
 type State struct {
@@ -391,6 +394,12 @@ func handleGetAssertionBegin(username string) ([]byte, error) {
 
 	log.Println("ClientDataHash: ", clientDataHash)
 
+	if len(credentialRequest.PublicKey.AllowCredentials) == 0x0 {
+		return nil, errors.New("AllowCredentials empty")
+	} else if len(credentialRequest.PublicKey.AllowCredentials) != 0x1 {
+		log.Println("Warning: allow list has more than 1 entry")
+	}
+
 	/*
 		Execute a client platform-specific procedure to determine which, if any,
 		public key credentials described by options.allowCredentials are bound
@@ -425,7 +434,20 @@ func handleGetAssertionBegin(username string) ([]byte, error) {
 			return nil, err
 		}
 
-		return b, nil
+		var resp Response
+		resp.FidoData = b
+		/*
+			Since DevEUI is globally unique we assume that there will always be
+			just one credential in allow list
+		*/
+		resp.PublicKey = credentialRequest.PublicKey.AllowCredentials[0].PublicKey
+
+		enc, err := json.Marshal(resp)
+		if err != nil {
+			return nil, err
+		}
+
+		return enc, nil
 	}
 
 	return nil, nil
@@ -548,13 +570,7 @@ func fido2Data(w http.ResponseWriter, req *http.Request) {
 
 	if len(res) > 0 {
 		w.Header().Set("Content-Type", "application/json")
-		enc, err := json.Marshal(Response{FidoData: res})
-		if err != nil {
-			http.Error(w, "Json encode response", http.StatusBadRequest)
-			return
-		}
-
-		w.Write(enc)
+		w.Write(res)
 	} else {
 		fmt.Fprintf(w, "Success \n")
 	}
