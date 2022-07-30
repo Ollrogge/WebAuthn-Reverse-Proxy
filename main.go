@@ -116,17 +116,17 @@ type MakeCredentialResp struct {
 }
 
 type PublicKeyCredentialDescriptor struct {
-	Type       string   `json:"type"`
-	Id         []byte   `json:"id"`
-	Transports []string `json:"transports,omitempty"`
-	PublicKey  []byte   `json:"publicKey,omitempty"`
+	Type       string   `json:"type" cbor:"type"`
+	Id         []byte   `json:"id" cbor:"id"`
+	Transports []string `json:"transports,omitempty" cbor:"transports,omitempty"`
+	PublicKey  []byte   `json:"publicKey,omitempty" cbor:"publicKey,omitempty"`
 }
 
 type PublicKeyCredentialRequestOptions struct {
 	Challenge        []byte                          `json:"challenge"`
 	Timeout          uint64                          `json:"timeout"`
 	RpId             string                          `json:"rpId"`
-	AllowCredentials []PublicKeyCredentialDescriptor `json:"allowCredentials"`
+	AllowCredentials []PublicKeyCredentialDescriptor `json:"allowCredentials,omitempty"`
 }
 
 type CredentialRequestOptions struct {
@@ -143,9 +143,9 @@ type CollectedClientData struct {
 
 // us -> authenticator
 type AuthenticatorGetAssertion struct {
-	RpId           string   `cbor:"1,keyasint"`
-	ClientDataHash []byte   `cbor:"2,keyasint"`
-	AllowList      [][]byte `cbor:"3,keyasint"`
+	RpId           string                          `cbor:"1,keyasint"`
+	ClientDataHash []byte                          `cbor:"2,keyasint"`
+	AllowList      []PublicKeyCredentialDescriptor `cbor:"3,keyasint,omitempty"`
 }
 
 type Response struct {
@@ -155,6 +155,26 @@ type Response struct {
 
 type State struct {
 	CollectedClientData CollectedClientData
+}
+
+// https://paulyeo21.medium.com/golang-underscore-struct-field-f0aecabc72ae
+type PublicKeyData struct {
+	// Decode the results to int by default.
+	_struct bool `cbor:",keyasint" json:"public_key"`
+	// The type of key created. Should be OKP, EC2, or RSA.
+	KeyType int64 `cbor:"1,keyasint" json:"kty"`
+	// A COSEAlgorithmIdentifier for the algorithm used to derive the key signature.
+	Algorithm int64 `cbor:"3,keyasint" json:"alg"`
+}
+
+type EC2PublicKeyData struct {
+	PublicKeyData
+	// If the key type is EC2, the curve on which we derive the signature from.
+	Curve int64 `cbor:"-1,keyasint,omitempty" json:"crv"`
+	// A byte string 32 bytes in length that holds the x coordinate of the key.
+	XCoord []byte `cbor:"-2,keyasint,omitempty" json:"x"`
+	// A byte string 32 bytes in length that holds the y coordinate of the key.
+	YCoord []byte `cbor:"-3,keyasint,omitempty" json:"y"`
 }
 
 func (p *AuthDataAttest) Unmarshal(data []byte) error {
@@ -405,12 +425,12 @@ func handleGetAssertionBegin(username string) ([]byte, error) {
 		public key credentials described by options.allowCredentials are bound
 		to this authenticator
 	*/
-	var credentialIds [][]byte
-	for _, cred := range credentialRequest.PublicKey.AllowCredentials {
-		credentialIds = append(credentialIds, cred.Id)
-	}
-
 	if Testing {
+		var credentialIds [][]byte
+		for _, cred := range credentialRequest.PublicKey.AllowCredentials {
+			credentialIds = append(credentialIds, cred.Id)
+		}
+
 		assertion, err := fidoClient.DeviceAssertion(credentialRequest.PublicKey.RpId,
 			clientDataHash[:], credentialIds)
 
@@ -420,14 +440,24 @@ func handleGetAssertionBegin(username string) ([]byte, error) {
 
 		pAssertion = assertion
 
-		handleAssertionFinish(nil)
+		handleAssertionFinish(username, nil)
 	} else {
 		var assert AuthenticatorGetAssertion
 		assert.RpId = credentialRequest.PublicKey.RpId
 		// In a nutshell, the [:] operator allows you to create a slice from an array
 		// array = fixed size, slice = variable size
 		assert.ClientDataHash = clientDataHash[:]
-		assert.AllowList = credentialIds
+
+		for _, cred := range credentialRequest.PublicKey.AllowCredentials {
+			log.Println("credential: ", cred.Type, len(cred.Id), len(cred.PublicKey), len(cred.Transports))
+		}
+
+		/*
+			leave allow list to save space
+			TODO: if re-adding it, need to remove all public keys from the struct else
+			gets way too big
+		*/
+		// assert.AllowList = credentialRequest.PublicKey.AllowCredentials
 
 		b, err := cbor.Marshal(assert)
 		if err != nil {
@@ -436,11 +466,21 @@ func handleGetAssertionBegin(username string) ([]byte, error) {
 
 		var resp Response
 		resp.FidoData = b
+
 		/*
 			Since DevEUI is globally unique we assume that there will always be
 			just one credential in allow list
 		*/
-		resp.PublicKey = credentialRequest.PublicKey.AllowCredentials[0].PublicKey
+		var pubKey EC2PublicKeyData
+		err = cbor.Unmarshal(credentialRequest.PublicKey.AllowCredentials[0].PublicKey,
+			&pubKey)
+		if err != nil {
+			return nil, err
+		}
+
+		resp.PublicKey = append(pubKey.XCoord, pubKey.YCoord...)
+
+		log.Println("Public key: ", resp.PublicKey, len(resp.PublicKey))
 
 		enc, err := json.Marshal(resp)
 		if err != nil {
@@ -453,7 +493,7 @@ func handleGetAssertionBegin(username string) ([]byte, error) {
 	return nil, nil
 }
 
-func handleAssertionFinish(data []byte) error {
+func handleAssertionFinish(username string, data []byte) ([]byte, error) {
 	log.Println("handleAssertionFinish")
 	var assertResp GetAssertionResp
 	var err error
@@ -465,7 +505,7 @@ func handleAssertionFinish(data []byte) error {
 	}
 
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	log.Println("GetAssertion: ", assertResp)
@@ -474,17 +514,17 @@ func handleAssertionFinish(data []byte) error {
 
 	err = cred.Unmarshal(&assertResp, &gClientData)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	enc, err := json.Marshal(cred)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	log.Println("Json encoded: ", string(enc))
 
-	req_url := BaseUrl + GetAssertionFinishUrl + "/" + DefaultUsername
+	req_url := BaseUrl + GetAssertionFinishUrl + "/" + username
 
 	client := &http.Client{
 		Jar: &gCookieJar,
@@ -495,19 +535,27 @@ func handleAssertionFinish(data []byte) error {
 
 	if err != nil {
 		fmt.Println("error: ", err)
-		return err
+		return nil, err
 	}
 
 	resp, err := client.Do(req)
 
 	if err != nil {
 		fmt.Println("error: ", err)
-		return err
+		return nil, err
 	}
 
 	fmt.Println("GetAssertion finish resp: ", resp)
 
-	return nil
+	var my_resp Response
+	my_resp.FidoData = []byte{}
+
+	enc, err = json.Marshal(my_resp)
+	if err != nil {
+		return nil, err
+	}
+
+	return enc, nil
 }
 
 // https://blog.questionable.services/article/http-handler-error-handling-revisited/
@@ -529,16 +577,17 @@ func fido2Data(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		fmt.Println("Postform: ", req.PostForm)
+		//fmt.Println("Postform: ", req.PostForm)
 
 		if len(req.PostForm) == 0 {
 			http.Error(w, "Missing post params", http.StatusInternalServerError)
 			return
 		}
 
-		log.Println("Postform fidoData: ", req.PostForm["fidoData"])
+		//log.Println("Postform fidoData: ", req.PostForm["fidoData"])
 
 		data := []byte(req.PostForm["fidoData"][0])
+		user := vars["user"]
 
 		switch data[0] {
 		case MakeCredentialBegin:
@@ -550,7 +599,6 @@ func fido2Data(w http.ResponseWriter, req *http.Request) {
 			fmt.Println("MakeCredential: ", resp)
 			break
 		case GetAssertionBegin:
-			user := vars["user"]
 			if len(user) == 0 {
 				http.Error(w, "GetAssertionBegin: Username missing", http.StatusBadRequest)
 				return
@@ -558,8 +606,15 @@ func fido2Data(w http.ResponseWriter, req *http.Request) {
 			res, err = handleGetAssertionBegin(user)
 			break
 		case GetAssertionFinish:
-			err = handleAssertionFinish(data[1:])
+			if len(user) == 0 {
+				http.Error(w, "GetAssertionBegin: Username missing", http.StatusBadRequest)
+				return
+			}
+			res, err = handleAssertionFinish(user, data[1:])
 			break
+		default:
+			log.Println("Unknown fido command: ", data[0])
+			http.Error(w, "Invalid FIDO request code", http.StatusBadRequest)
 		}
 	}
 
