@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	_ "errors"
@@ -91,6 +92,7 @@ type GetAssertionResp struct {
 	Credential Credential
 	AuthData   AuthDataAssert
 	Sig        []byte
+	UserHandle []byte
 }
 
 // https://www.w3.org/TR/webauthn/#authenticatorassertionresponse
@@ -98,15 +100,15 @@ type AuthenticatorResponse struct {
 	AuthData       string `json:"authenticatorData"`
 	ClientDataJson string `json:"clientDataJSON"`
 	Sig            string `json:"signature"`
-	UserHandle     string `json:"userHandle"`
+	UserHandle     string `json:"userHandle,omitempty"`
 }
 
 /* us -> fido2 server */
 type PubKeyCredential struct {
-	Id      string                `json:"id"`
-	RawId   string                `json:"rawId"`
-	Type    string                `json:"type"`
-	Reponse AuthenticatorResponse `json:"response"`
+	Id       string                `json:"id"`
+	RawId    string                `json:"rawId"`
+	Type     string                `json:"type"`
+	Response AuthenticatorResponse `json:"response"`
 }
 
 type MakeCredentialResp struct {
@@ -119,7 +121,8 @@ type PublicKeyCredentialDescriptor struct {
 	Type       string   `json:"type" cbor:"type"`
 	Id         []byte   `json:"id" cbor:"id"`
 	Transports []string `json:"transports,omitempty" cbor:"transports,omitempty"`
-	PublicKey  []byte   `json:"publicKey,omitempty" cbor:"publicKey,omitempty"`
+	//PublicKey  []byte   `json:"publicKey,omitempty" cbor:"publicKey,omitempty"`
+	PublicKey []byte `json:"publicKey,omitempty" cbor:"-"`
 }
 
 type PublicKeyCredentialRequestOptions struct {
@@ -221,7 +224,8 @@ func (p *PubKeyCredential) Unmarshal(
 	if err != nil {
 		return err
 	}
-	err = binary.Write(&authData, binary.BigEndian, cred.AuthData.SignCount)
+
+	err = binary.Write(&authData, binary.LittleEndian, cred.AuthData.SignCount)
 	if err != nil {
 		return err
 	}
@@ -231,9 +235,10 @@ func (p *PubKeyCredential) Unmarshal(
 		return err
 	}
 
-	p.Reponse.ClientDataJson = base64.RawURLEncoding.EncodeToString(clientDataJson)
-	p.Reponse.AuthData = base64.RawURLEncoding.EncodeToString(authData.Bytes())
-	p.Reponse.Sig = base64.RawURLEncoding.EncodeToString(cred.Sig)
+	p.Response.ClientDataJson = base64.RawURLEncoding.EncodeToString(clientDataJson)
+	p.Response.AuthData = base64.RawURLEncoding.EncodeToString(authData.Bytes())
+	p.Response.Sig = base64.RawURLEncoding.EncodeToString(cred.Sig)
+	p.Response.UserHandle = base64.RawURLEncoding.EncodeToString(cred.UserHandle)
 
 	return nil
 }
@@ -273,10 +278,14 @@ func decodeMakeCredentialResp(resp *MakeCredentialResp, data []byte) {
 }
 
 func (p *GetAssertionResp) Unmarshal(data []byte) error {
+	type _user struct {
+		Id []byte `cbor:"id"`
+	}
 	type _resp struct {
 		Credential Credential `cbor:"1,keyasint"`
 		AuthData   []byte     `cbor:"2,keyasint"`
 		Sig        []byte     `cbor:"3,keyasint"`
+		UserHandle _user      `cbor:"4,keyasint,omitempty"`
 	}
 
 	var v _resp
@@ -289,9 +298,12 @@ func (p *GetAssertionResp) Unmarshal(data []byte) error {
 		return err
 	}
 
+	log.Println("Userhandle: ", hex.EncodeToString(p.UserHandle))
+
 	p.Credential = v.Credential
 	p.AuthData = a
 	p.Sig = v.Sig
+	p.UserHandle = v.UserHandle.Id
 
 	return nil
 }
@@ -342,15 +354,12 @@ func handleMakeCredentialBegin() error {
 		return err
 	}
 
-	resp, err := client.Do(req)
+	_, err = client.Do(req)
 
 	if err != nil {
 		fmt.Println("error: ", err)
 		return err
 	}
-
-	fmt.Println("MakeCredentialBegin resp: ", resp)
-	log.Println("Jar: ", cookieJar)
 
 	return nil
 }
@@ -412,8 +421,6 @@ func handleGetAssertionBegin(username string) ([]byte, error) {
 
 	clientDataHash := sha256.Sum256(clientDataJson)
 
-	log.Println("ClientDataHash: ", clientDataHash)
-
 	if len(credentialRequest.PublicKey.AllowCredentials) == 0x0 {
 		return nil, errors.New("AllowCredentials empty")
 	} else if len(credentialRequest.PublicKey.AllowCredentials) != 0x1 {
@@ -449,17 +456,23 @@ func handleGetAssertionBegin(username string) ([]byte, error) {
 		assert.ClientDataHash = clientDataHash[:]
 
 		for _, cred := range credentialRequest.PublicKey.AllowCredentials {
-			log.Println("credential: ", cred.Type, len(cred.Id), len(cred.PublicKey), len(cred.Transports))
+			log.Println("credential: ", cred.Type, hex.EncodeToString(cred.Id))
 		}
 
 		/*
-			leave allow list to save space
 			TODO: if re-adding it, need to remove all public keys from the struct else
 			gets way too big
 		*/
-		// assert.AllowList = credentialRequest.PublicKey.AllowCredentials
+		assert.AllowList = credentialRequest.PublicKey.AllowCredentials
 
-		b, err := cbor.Marshal(assert)
+		var opts = cbor.CTAP2EncOptions()
+
+		em, err := opts.EncMode()
+		if err != nil {
+			return nil, err
+		}
+
+		b, err := em.Marshal(assert)
 		if err != nil {
 			return nil, err
 		}
@@ -479,8 +492,6 @@ func handleGetAssertionBegin(username string) ([]byte, error) {
 		}
 
 		resp.PublicKey = append(pubKey.XCoord, pubKey.YCoord...)
-
-		log.Println("Public key: ", resp.PublicKey, len(resp.PublicKey))
 
 		enc, err := json.Marshal(resp)
 		if err != nil {
@@ -522,8 +533,6 @@ func handleAssertionFinish(username string, data []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	log.Println("Json encoded: ", string(enc))
-
 	req_url := BaseUrl + GetAssertionFinishUrl + "/" + username
 
 	client := &http.Client{
@@ -546,6 +555,10 @@ func handleAssertionFinish(username string, data []byte) ([]byte, error) {
 	}
 
 	fmt.Println("GetAssertion finish resp: ", resp)
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, errors.New("get assertion finish error")
+	}
 
 	var my_resp Response
 	my_resp.FidoData = []byte{}
