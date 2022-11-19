@@ -298,8 +298,6 @@ func (p *GetAssertionResp) Unmarshal(data []byte) error {
 		return err
 	}
 
-	log.Println("Userhandle: ", hex.EncodeToString(p.UserHandle))
-
 	p.Credential = v.Credential
 	p.AuthData = a
 	p.Sig = v.Sig
@@ -576,7 +574,6 @@ func fido2Data(w http.ResponseWriter, req *http.Request) {
 
 	vars := mux.Vars(req)
 
-	log.Println("vars: ", vars)
 	var err error
 	var res []byte
 
@@ -594,6 +591,16 @@ func fido2Data(w http.ResponseWriter, req *http.Request) {
 
 		if len(req.PostForm) == 0 {
 			http.Error(w, "Missing post params", http.StatusInternalServerError)
+			return
+		}
+
+		if _, ok := req.PostForm["fidoData"]; !ok {
+			http.Error(w, "Missing fidoData in post params", http.StatusInternalServerError)
+			return
+		}
+
+		if len(req.PostForm["fidoData"][0]) == 0 {
+			http.Error(w, "FidoFata len = 0", http.StatusInternalServerError)
 			return
 		}
 
