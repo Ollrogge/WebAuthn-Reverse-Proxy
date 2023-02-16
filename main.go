@@ -419,11 +419,13 @@ func handleGetAssertionBegin(username string) ([]byte, error) {
 
 	clientDataHash := sha256.Sum256(clientDataJson)
 
-	if len(credentialRequest.PublicKey.AllowCredentials) == 0x0 {
-		return nil, errors.New("AllowCredentials empty")
-	} else if len(credentialRequest.PublicKey.AllowCredentials) != 0x1 {
-		log.Println("Warning: allow list has more than 1 entry")
-	}
+	/*
+		if len(credentialRequest.PublicKey.AllowCredentials) == 0x0 {
+			return nil, errors.New("AllowCredentials empty")
+		} else if len(credentialRequest.PublicKey.AllowCredentials) != 0x1 {
+			log.Println("Warning: allow list has more than 1 entry")
+		}
+	*/
 
 	/*
 		Execute a client platform-specific procedure to determine which, if any,
@@ -482,14 +484,17 @@ func handleGetAssertionBegin(username string) ([]byte, error) {
 			Since DevEUI is globally unique we assume that there will always be
 			just one credential in allow list
 		*/
-		var pubKey EC2PublicKeyData
-		err = cbor.Unmarshal(credentialRequest.PublicKey.AllowCredentials[0].PublicKey,
-			&pubKey)
-		if err != nil {
-			return nil, err
-		}
 
-		resp.PublicKey = append(pubKey.XCoord, pubKey.YCoord...)
+		if len(credentialRequest.PublicKey.AllowCredentials) > 0 {
+			var pubKey EC2PublicKeyData
+			err = cbor.Unmarshal(credentialRequest.PublicKey.AllowCredentials[0].PublicKey,
+				&pubKey)
+			if err != nil {
+				return nil, err
+			}
+
+			resp.PublicKey = append(pubKey.XCoord, pubKey.YCoord...)
+		}
 
 		enc, err := json.Marshal(resp)
 		if err != nil {
